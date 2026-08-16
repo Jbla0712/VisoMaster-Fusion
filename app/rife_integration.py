@@ -73,23 +73,23 @@ def _run_rife(input_video: Path, output_video: Path, multiplier: int, fps: float
     rife_root = ensure_rife_installation()
     exp = _MODE_TO_EXP.get(f"{multiplier}x", 1)
     scale = 0.5 if _video_is_4k_or_higher(input_video) else 1.0
+    # Do not import the VisoMaster package inside the RIFE subprocess.  The
+    # subprocess runs with RIFE's directory as cwd so its model/ and train_log/
+    # imports and relative paths resolve exactly as expected by inference_video.py.
     compat = (
-        "import sys; "
-        "from app.rife_numpy_compat import patch_legacy_numpy_aliases; "
-        "patch_legacy_numpy_aliases(); "
-        "sys.path.insert(0, sys.argv.pop(1)); "
-        "script = sys.argv.pop(1); "
-        "sys.argv[0] = script; "
+        "import sys, numpy as np; "
+        "aliases={'bool':bool,'int':int,'float':float,'complex':complex,'object':object,'str':str}; "
+        "[setattr(np,k,v) for k,v in aliases.items() if k not in np.__dict__]; "
+        "script=sys.argv.pop(1); sys.argv[0]=script; "
         "exec(compile(open(script, encoding='utf-8').read(), script, 'exec'))"
     )
     cmd = [
         sys.executable, "-c", compat,
-        str(_project_root()), str(rife_root / "inference_video.py"),
+        str(rife_root / "inference_video.py"),
         "--exp", str(exp), "--video", str(input_video), "--output", str(output_video),
         "--fps", str(max(1, int(round(fps * multiplier)))), "--scale", str(scale),
     ]
     print(f"[RIFE] Starting {multiplier}x interpolation at {fps * multiplier:.3f} FPS")
-    # RIFE resolves `model.*` and the default `train_log` relative to its own root.
     result = subprocess.run(cmd, cwd=str(rife_root), check=False)
     if result.returncode != 0 or not output_video.exists() or output_video.stat().st_size == 0:
         print(f"[RIFE] Interpolation failed with exit code {result.returncode}; keeping original render.")
