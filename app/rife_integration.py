@@ -9,8 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PySide6.QtCore import QObject, QTimer
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 _MODE_TO_EXP = {"Off": 0, "2x": 1, "4x": 2, "8x": 3}
 
@@ -24,12 +23,7 @@ def _rife_root() -> Path:
 
 
 class _RifePreviewEngine:
-    """Lazy RIFE engine used only by the GUI preview path.
-
-    RIFE inference is deliberately kept off the video-processing thread. Only
-    one request is allowed in flight, and requests become stale immediately
-    when playback advances or the user disables RIFE.
-    """
+    """Lazy, throttled RIFE engine used only by the GUI preview path."""
 
     def __init__(self) -> None:
         self.model: Any | None = None
@@ -40,12 +34,13 @@ class _RifePreviewEngine:
         self._busy = False
         self._generation = 0
         self._cuda_stream: torch.cuda.Stream | None = None
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="RIFE-Preview-Worker",
-            daemon=True,
-        )
+        self._worker = threading.Thread(target=self._worker_loop, name="RIFE-Preview-Worker", daemon=True)
         self._worker.start()
+
+    @property
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
 
     def _load(self) -> Any:
         if self.model is not None:
@@ -91,7 +86,7 @@ class _RifePreviewEngine:
     def _crop(tensor: torch.Tensor, size: tuple[int, int]) -> np.ndarray:
         h, w = size
         out = tensor[0, :, :h, :w].clamp(0, 1)
-        return (out.mul(255.0).byte().permute(1, 2, 0).cpu().numpy()).copy()
+        return out.mul(255.0).byte().permute(1, 2, 0).cpu().numpy().copy()
 
     def _infer(self, model: Any, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
         return model.inference(first, second, scale=1.0)
@@ -129,18 +124,9 @@ class _RifePreviewEngine:
                     current.wait_stream(self._cuda_stream)
                     return result
 
-                mids = recurse(a, b, count)
-                return [self._crop(x, (h, w)) for x in mids]
+                return [self._crop(x, (h, w)) for x in recurse(a, b, count)]
 
-    def enqueue(
-        self,
-        first: np.ndarray,
-        second: np.ndarray,
-        count: int,
-        main_window: Any,
-        frame_number: int,
-        factor: int,
-    ) -> None:
+    def enqueue(self, first: np.ndarray, second: np.ndarray, count: int, main_window: Any, frame_number: int, factor: int) -> None:
         if count <= 0:
             return
         with self._condition:
@@ -172,27 +158,16 @@ class _RifePreviewEngine:
                 request = self._pending
                 self._pending = None
                 self._busy = True
-
             try:
-                if request is None:
-                    continue
                 first, second, count, main_window, frame_number, factor, generation = request
                 mids = self.interpolate(first, second, count)
                 with self._condition:
                     current_generation = self._generation
-                if generation != current_generation:
-                    continue
-                if not mids:
+                if generation != current_generation or not mids:
                     continue
                 delay_ms = max(1, int(getattr(main_window, "target_delay_sec", 1 / 30.0) * 1000 / factor))
                 for index, mid in enumerate(mids, start=1):
-                    _PREVIEW_DISPATCHER.show_frame.emit(
-                        main_window,
-                        mid,
-                        frame_number,
-                        delay_ms * index,
-                        generation,
-                    )
+                    _PREVIEW_DISPATCHER.show_frame.emit(main_window, mid, frame_number, delay_ms * index, generation)
                 print(f"[RIFE-PREVIEW] queued {len(mids)} intermediate frame(s)")
             except Exception as exc:
                 print(f"[RIFE-PREVIEW] Worker error: {exc}")
@@ -211,26 +186,18 @@ class _RifePreviewDispatcher(QObject):
         self.show_frame.connect(self._show_frame)
 
     @staticmethod
-    def _show_frame(
-        main_window: Any,
-        frame: np.ndarray,
-        frame_number: int,
-        delay_ms: int,
-        generation: int,
-    ) -> None:
+    def _show_frame(main_window: Any, frame: np.ndarray, frame_number: int, delay_ms: int, generation: int) -> None:
         def show() -> None:
             try:
                 if generation != _PREVIEW_ENGINE.generation:
                     return
-                selection = str(main_window.control.get("RIFEInterpolationSelection", "Off"))
-                if selection == "Off":
+                if str(main_window.control.get("RIFEInterpolationSelection", "Off")) == "Off":
                     return
                 from app.ui.widgets.actions import graphics_view_actions, common_actions
                 pixmap = common_actions.get_pixmap_from_frame(main_window, frame)
                 graphics_view_actions.update_graphics_view(main_window, pixmap, frame_number)
             except Exception as exc:
                 print(f"[RIFE-PREVIEW] GUI dispatch failed: {exc}")
-
         QTimer.singleShot(max(1, delay_ms), show)
 
 
@@ -265,10 +232,8 @@ def install_settings(settings_layout_data: dict[str, Any]) -> None:
 def patch_preview_pipeline() -> None:
     """Attach throttled asynchronous RIFE interpolation to preview only."""
     from app.processors.video_processor import VideoProcessor
-
     if getattr(VideoProcessor, "_rife_preview_patched", False):
         return
-
     original = VideoProcessor.display_next_frame
 
     def wrapped(self: Any, *args: Any, **kwargs: Any):
@@ -286,14 +251,7 @@ def patch_preview_pipeline() -> None:
             next_frame = self.frames_to_display.get(next_number)
             if next_frame is None:
                 return result
-            _PREVIEW_ENGINE.enqueue(
-                self.current_frame,
-                next_frame,
-                factor - 1,
-                self.main_window,
-                next_number - 1,
-                factor,
-            )
+            _PREVIEW_ENGINE.enqueue(self.current_frame, next_frame, factor - 1, self.main_window, next_number - 1, factor)
         except Exception as exc:
             print(f"[RIFE-PREVIEW] Disabled for this frame after error: {exc}")
         return result
