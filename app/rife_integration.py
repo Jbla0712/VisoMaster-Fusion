@@ -35,7 +35,7 @@ def _download(url: str, destination: Path) -> None:
 
 def ensure_rife_installation() -> Path:
     root = _rife_root()
-    if (root / "inference_video.py").exists() and (root / "train_log").exists():
+    if (root / "inference_video.py").exists() and (root / "train_log" / "flownet.pkl").exists():
         return root
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="rife_install_") as tmp:
@@ -78,20 +78,19 @@ def _run_rife(input_video: Path, output_video: Path, multiplier: int, fps: float
         "from app.rife_numpy_compat import patch_legacy_numpy_aliases; "
         "patch_legacy_numpy_aliases(); "
         "sys.path.insert(0, sys.argv.pop(1)); "
-        "sys.argv[0] = sys.argv[1]; "
-        "sys.argv.pop(1); "
-        "exec(compile(open(sys.argv[0], encoding='utf-8').read(), sys.argv[0], 'exec'))"
+        "script = sys.argv.pop(1); "
+        "sys.argv[0] = script; "
+        "exec(compile(open(script, encoding='utf-8').read(), script, 'exec'))"
     )
-    # Keep the RIFE script path outside its argparse arguments.  The previous
-    # launcher accidentally exposed the two internal paths as CLI arguments.
     cmd = [
         sys.executable, "-c", compat,
-        str(rife_root), str(rife_root / "inference_video.py"),
+        str(_project_root()), str(rife_root / "inference_video.py"),
         "--exp", str(exp), "--video", str(input_video), "--output", str(output_video),
         "--fps", str(max(1, int(round(fps * multiplier)))), "--scale", str(scale),
     ]
     print(f"[RIFE] Starting {multiplier}x interpolation at {fps * multiplier:.3f} FPS")
-    result = subprocess.run(cmd, cwd=str(_project_root()), check=False)
+    # RIFE resolves `model.*` and the default `train_log` relative to its own root.
+    result = subprocess.run(cmd, cwd=str(rife_root), check=False)
     if result.returncode != 0 or not output_video.exists() or output_video.stat().st_size == 0:
         print(f"[RIFE] Interpolation failed with exit code {result.returncode}; keeping original render.")
         return False
