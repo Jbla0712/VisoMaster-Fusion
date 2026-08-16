@@ -9,7 +9,8 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import Signal
 
 _MODE_TO_EXP = {"Off": 0, "2x": 1, "4x": 2, "8x": 3}
 
@@ -26,8 +27,8 @@ class _RifePreviewEngine:
     """Lazy RIFE engine used only by the GUI preview path.
 
     RIFE inference is deliberately kept off the video-processing thread. The
-    preview worker keeps only the newest request so a slow GPU inference can
-    never build an unbounded backlog and stall playback.
+    preview worker accepts only one request at a time so GPU-heavy inference
+    cannot build a backlog and compete continuously with normal playback.
     """
 
     def __init__(self) -> None:
@@ -35,7 +36,9 @@ class _RifePreviewEngine:
         self.lock = threading.Lock()
         self.loaded = False
         self._condition = threading.Condition()
-        self._pending: tuple[np.ndarray, np.ndarray, int, Any, int] | None = None
+        self._pending: tuple[np.ndarray, np.ndarray, int, Any, int, int] | None = None
+        self._busy = False
+        self._cuda_stream: torch.cuda.Stream | None = None
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="RIFE-Preview-Worker",
@@ -59,6 +62,9 @@ class _RifePreviewEngine:
         model.eval()
         if hasattr(model, "device"):
             model.device()
+        if torch.cuda.is_available():
+            # Positive priority gives normal playback work precedence over RIFE.
+            self._cuda_stream = torch.cuda.Stream(priority=2)
         self.model = model
         self.loaded = True
         gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -115,6 +121,15 @@ class _RifePreviewEngine:
                         return [*left, mid, *right]
                     return [*left, *right]
 
+                if self._cuda_stream is not None:
+                    current = torch.cuda.current_stream()
+                    self._cuda_stream.wait_stream(current)
+                    with torch.cuda.stream(self._cuda_stream):
+                        mids = recurse(a, b, count)
+                        result = [self._crop(x, (h, w)) for x in mids]
+                    current.wait_stream(self._cuda_stream)
+                    return result
+
                 mids = recurse(a, b, count)
                 return [self._crop(x, (h, w)) for x in mids]
 
@@ -125,6 +140,7 @@ class _RifePreviewEngine:
         count: int,
         main_window: Any,
         frame_number: int,
+        factor: int,
     ) -> None:
         if count <= 0:
             return
@@ -134,13 +150,13 @@ class _RifePreviewEngine:
             count,
             main_window,
             frame_number,
+            factor,
         )
         with self._condition:
-            replaced = self._pending is not None
+            if self._busy or self._pending is not None:
+                return
             self._pending = request
             self._condition.notify()
-        if replaced:
-            print("[RIFE-PREVIEW] Dropped stale interpolation request")
 
     def _worker_loop(self) -> None:
         while True:
@@ -149,45 +165,73 @@ class _RifePreviewEngine:
                     self._condition.wait()
                 request = self._pending
                 self._pending = None
+                self._busy = True
 
-            if request is None:
-                continue
-            first, second, count, main_window, frame_number = request
             try:
+                if request is None:
+                    continue
+                first, second, count, main_window, frame_number, factor = request
                 mids = self.interpolate(first, second, count)
                 if not mids:
                     continue
-                for mid in mids:
+                delay_ms = max(
+                    1,
+                    int(
+                        getattr(main_window, "target_delay_sec", 1 / 30.0)
+                        * 1000
+                        / factor
+                    ),
+                )
+                for index, mid in enumerate(mids, start=1):
                     _PREVIEW_DISPATCHER.show_frame.emit(
                         main_window,
                         mid,
                         frame_number,
+                        delay_ms * index,
                     )
                 print(f"[RIFE-PREVIEW] queued {len(mids)} intermediate frame(s)")
             except Exception as exc:
                 print(f"[RIFE-PREVIEW] Worker error: {exc}")
+            finally:
+                with self._condition:
+                    self._busy = False
 
 
 class _RifePreviewDispatcher(QObject):
     """Dispatch RIFE-generated preview frames onto the Qt GUI thread."""
 
-    show_frame = Signal(object, object, object)
+    show_frame = Signal(object, object, object, int)
 
     def __init__(self) -> None:
         super().__init__()
         self.show_frame.connect(self._show_frame)
 
     @staticmethod
-    def _show_frame(main_window: Any, frame: np.ndarray, frame_number: int) -> None:
-        try:
-            from app.ui.widgets.actions import graphics_view_actions, common_actions
+    def _show_frame(
+        main_window: Any,
+        frame: np.ndarray,
+        frame_number: int,
+        delay_ms: int,
+    ) -> None:
+        def show() -> None:
+            try:
+                selection = str(
+                    main_window.control.get("RIFEInterpolationSelection", "Off")
+                )
+                if selection == "Off":
+                    return
+                from app.ui.widgets.actions import graphics_view_actions, common_actions
 
-            pixmap = common_actions.get_pixmap_from_frame(main_window, frame)
-            graphics_view_actions.update_graphics_view(
-                main_window, pixmap, frame_number
-            )
-        except Exception as exc:
-            print(f"[RIFE-PREVIEW] GUI dispatch failed: {exc}")
+                pixmap = common_actions.get_pixmap_from_frame(main_window, frame)
+                graphics_view_actions.update_graphics_view(
+                    main_window, pixmap, frame_number
+                )
+            except Exception as exc:
+                print(f"[RIFE-PREVIEW] GUI dispatch failed: {exc}")
+
+        # This slot is invoked in the GUI thread by Qt's queued connection, so
+        # the timer is created/started in the correct event-loop thread.
+        QTimer.singleShot(max(1, delay_ms), show)
 
 
 _PREVIEW_DISPATCHER = _RifePreviewDispatcher()
@@ -217,7 +261,7 @@ def install_settings(settings_layout_data: dict[str, Any]) -> None:
 
 
 def patch_preview_pipeline() -> None:
-    """Attach asynchronous RIFE interpolation between preview frames only."""
+    """Attach asynchronous, throttled RIFE interpolation to preview only."""
     from app.processors.video_processor import VideoProcessor
 
     if getattr(VideoProcessor, "_rife_preview_patched", False):
@@ -251,6 +295,7 @@ def patch_preview_pipeline() -> None:
                 factor - 1,
                 self.main_window,
                 next_number - 1,
+                factor,
             )
         except Exception as exc:
             print(f"[RIFE-PREVIEW] Disabled for this frame after error: {exc}")
@@ -258,7 +303,7 @@ def patch_preview_pipeline() -> None:
 
     VideoProcessor.display_next_frame = wrapped
     VideoProcessor._rife_preview_patched = True
-    print("[RIFE-PREVIEW] Async preview pipeline installed (recording/export untouched)")
+    print("[RIFE-PREVIEW] Throttled async preview pipeline installed (recording/export untouched)")
 
 
 def patch_ffmpeg_encoder() -> None:
