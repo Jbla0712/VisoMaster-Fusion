@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import importlib
+import sys
+import threading
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PySide6.QtCore import QTimer
 
 _MODE_TO_EXP = {"Off": 0, "2x": 1, "4x": 2, "8x": 3}
 
@@ -14,22 +22,95 @@ def _rife_root() -> Path:
     return _project_root() / "models" / "RIFE" / "ECCV2022-RIFE"
 
 
-def _preview_rife(*args: Any, **kwargs: Any) -> None:
-    """Preview-only hook.
+class _RifePreviewEngine:
+    """Lazy RIFE engine used only by the GUI preview path."""
 
-    Final video encoding is intentionally untouched. The preview processor can
-    call this hook with two decoded frames and a selected multiplier when the
-    preview path is wired to it.
-    """
-    return None
+    def __init__(self) -> None:
+        self.model: Any | None = None
+        self.lock = threading.Lock()
+        self.loaded = False
+
+    def _load(self) -> Any:
+        if self.model is not None:
+            return self.model
+        root = _rife_root()
+        model_dir = root / "train_log"
+        if not (model_dir / "flownet.pkl").exists():
+            raise FileNotFoundError(f"RIFE model not found: {model_dir / 'flownet.pkl'}")
+        root_str = str(root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        module = importlib.import_module("train_log.RIFE_HDv3")
+        model = module.Model()
+        model.load_model(str(model_dir), -1)
+        model.eval()
+        if hasattr(model, "device"):
+            model.device()
+        self.model = model
+        self.loaded = True
+        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+        print(f"[RIFE-PREVIEW] Model loaded: HDv3 | Device: {gpu}")
+        return model
+
+    @staticmethod
+    def _to_tensor(frame: np.ndarray) -> tuple[torch.Tensor, int, int]:
+        h, w = frame.shape[:2]
+        rgb = np.ascontiguousarray(frame[:, :, :3])
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        if torch.cuda.is_available():
+            tensor = tensor.cuda(non_blocking=True)
+        return tensor, h, w
+
+    @staticmethod
+    def _pad(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
+        _, _, h, w = tensor.shape
+        ph = (32 - h % 32) % 32
+        pw = (32 - w % 32) % 32
+        return F.pad(tensor, (0, pw, 0, ph)), (ph, pw)
+
+    @staticmethod
+    def _crop(tensor: torch.Tensor, size: tuple[int, int]) -> np.ndarray:
+        h, w = size
+        out = tensor[0, :, :h, :w].clamp(0, 1)
+        return (out.mul(255.0).byte().permute(1, 2, 0).cpu().numpy()).copy()
+
+    def interpolate(self, first: np.ndarray, second: np.ndarray, count: int) -> list[np.ndarray]:
+        if count <= 0:
+            return []
+        with self.lock:
+            model = self._load()
+            with torch.inference_mode():
+                a, h, w = self._to_tensor(first)
+                b, _, _ = self._to_tensor(second)
+                a, _ = self._pad(a)
+                b, _ = self._pad(b)
+
+                def recurse(x: torch.Tensor, y: torch.Tensor, n: int) -> list[torch.Tensor]:
+                    if n <= 0:
+                        return []
+                    mid = model.inference(x, y, timestep=0.5, scale=1.0)
+                    if n == 1:
+                        return [mid]
+                    half = n // 2
+                    left = recurse(x, mid, half)
+                    right = recurse(mid, y, half)
+                    if n % 2:
+                        return [*left, mid, *right]
+                    return [*left, *right]
+
+                mids = recurse(a, b, count)
+                return [self._crop(x, (h, w)) for x in mids]
+
+
+_PREVIEW_ENGINE = _RifePreviewEngine()
 
 
 def set_rife_interpolation(main_window: Any, value: str) -> None:
-    # Store the selection for the preview pipeline only. Never patch FFmpeg.
     try:
         main_window.control["RIFEInterpolationSelection"] = value
-    except Exception:
-        pass
+        print(f"[RIFE-PREVIEW] Selection changed: {value}")
+    except Exception as exc:
+        print(f"[RIFE-PREVIEW] Could not update selection: {exc}")
 
 
 def install_settings(settings_layout_data: dict[str, Any]) -> None:
@@ -46,13 +127,72 @@ def install_settings(settings_layout_data: dict[str, Any]) -> None:
         }
 
 
+def patch_preview_pipeline() -> None:
+    """Attach RIFE between already-processed preview frames.
+
+    The existing VideoProcessor remains responsible for decoding, processing,
+    recording and normal playback. RIFE only adds temporary GUI frames between
+    two processed frames, and is completely disabled while recording.
+    """
+    from app.processors.video_processor import VideoProcessor
+    from app.ui.widgets.actions import graphics_view_actions, common_actions
+
+    if getattr(VideoProcessor, "_rife_preview_patched", False):
+        return
+
+    original = VideoProcessor.display_next_frame
+
+    def wrapped(self: Any, *args: Any, **kwargs: Any):
+        result = original(self, *args, **kwargs)
+
+        try:
+            selection = str(self.main_window.control.get("RIFEInterpolationSelection", "Off"))
+            factor = {"Off": 1, "2x": 2, "4x": 4, "8x": 8}.get(selection, 1)
+            if factor <= 1 or self.recording or self.is_processing_segments:
+                return result
+            if self.file_type != "video" or self.current_frame is None:
+                return result
+
+            next_number = self.next_frame_to_display
+            next_frame = self.frames_to_display.get(next_number)
+            if next_frame is None:
+                return result
+
+            print(f"[RIFE-PREVIEW] {selection}: interpolating frame {next_number - 1} -> {next_number}")
+            mids = _PREVIEW_ENGINE.interpolate(self.current_frame, next_frame, factor - 1)
+            if not mids:
+                return result
+
+            # The normal metronome has already scheduled the next source frame.
+            # Insert the intermediate frames on the same GUI event loop at evenly
+            # spaced offsets. They never enter the recording encoder.
+            delay_ms = max(1, int((getattr(self, "target_delay_sec", 1 / 30.0) * 1000) / factor))
+            for index, mid in enumerate(mids, start=1):
+                def show(frame=mid):
+                    if self.recording or self.is_processing_segments:
+                        return
+                    pixmap = common_actions.get_pixmap_from_frame(self.main_window, frame)
+                    graphics_view_actions.update_graphics_view(
+                        self.main_window, pixmap, next_number - 1
+                    )
+                QTimer.singleShot(delay_ms * index, show)
+
+            print(f"[RIFE-PREVIEW] queued {len(mids)} intermediate frame(s)")
+        except Exception as exc:
+            print(f"[RIFE-PREVIEW] Disabled for this frame after error: {exc}")
+        return result
+
+    VideoProcessor.display_next_frame = wrapped
+    VideoProcessor._rife_preview_patched = True
+    print("[RIFE-PREVIEW] Preview pipeline installed (recording/export untouched)")
+
+
 def patch_ffmpeg_encoder() -> None:
     # Deliberately disabled: RIFE is preview-only now.
     return None
 
 
 def patch_video_processor_stop() -> None:
-    # Deliberately disabled: preview-only integration must not alter recording.
     return None
 
 
@@ -61,5 +201,5 @@ def cancel_rife_for_encoder(encoder: Any) -> None:
 
 
 def apply_rife_to_encoded_video(encoder: Any) -> None:
-    # Kept as a no-op compatibility entry point for existing imports.
+    # Compatibility no-op: recording/export must never invoke RIFE.
     return None
