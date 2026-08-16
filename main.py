@@ -41,7 +41,11 @@ def _run_app() -> None:
     # importing. Doing this from app.__init__ causes a circular import because
     # settings_layout_data itself imports modules below the app package.
     from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
-    from app.rife_integration import install_settings, patch_ffmpeg_encoder
+    from app.rife_integration import (
+        install_settings,
+        patch_ffmpeg_encoder,
+        patch_preview_pipeline,
+    )
 
     install_settings(SETTINGS_LAYOUT_DATA)
     patch_ffmpeg_encoder()
@@ -71,6 +75,7 @@ def _run_app() -> None:
         )
         app.setStyleSheet(_style)
     window = main_ui.MainWindow(gpu_id=args.gpu_id)
+    patch_preview_pipeline()
     window.show()
     app.exec()
 
