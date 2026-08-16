@@ -237,6 +237,10 @@ def patch_preview_pipeline() -> None:
     original = VideoProcessor.display_next_frame
 
     def wrapped(self: Any, *args: Any, **kwargs: Any):
+        if not getattr(self, "_rife_cancel_connected", False):
+            self.processing_stopped_signal.connect(_PREVIEW_ENGINE.cancel)
+            self._rife_cancel_connected = True
+
         result = original(self, *args, **kwargs)
         try:
             selection = str(self.main_window.control.get("RIFEInterpolationSelection", "Off"))
@@ -258,7 +262,6 @@ def patch_preview_pipeline() -> None:
 
     VideoProcessor.display_next_frame = wrapped
     VideoProcessor._rife_preview_patched = True
-    VideoProcessor.processing_stopped_signal.connect(_PREVIEW_ENGINE.cancel)
     print("[RIFE-PREVIEW] Throttled async preview pipeline installed (recording/export untouched)")
 
 
