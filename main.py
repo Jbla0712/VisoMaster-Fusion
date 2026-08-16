@@ -37,6 +37,15 @@ def _run_app() -> None:
     from app.ui import main_ui
     from PySide6 import QtWidgets
 
+    # RIFE must be installed only after the UI/settings modules have finished
+    # importing. Doing this from app.__init__ causes a circular import because
+    # settings_layout_data itself imports modules below the app package.
+    from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
+    from app.rife_integration import install_settings, patch_ffmpeg_encoder
+
+    install_settings(SETTINGS_LAYOUT_DATA)
+    patch_ffmpeg_encoder()
+
     import qdarktheme
     from app.ui.core.proxy_style import ProxyStyle
 
