@@ -75,12 +75,20 @@ def _run_rife(input_video: Path, output_video: Path, multiplier: int, fps: float
     exp = _MODE_TO_EXP.get(f"{multiplier}x", 1)
     scale = 0.5 if _video_is_4k_or_higher(input_video) else 1.0
     cmd = [
-        sys.executable, str(rife_root / "inference_video.py"),
+        sys.executable, "-c",
+        (
+            "import sys; "
+            "from app.rife_numpy_compat import patch_legacy_numpy_aliases; "
+            "patch_legacy_numpy_aliases(); "
+            "sys.path.insert(0, sys.argv[1]); "
+            "exec(compile(open(sys.argv[2], encoding='utf-8').read(), sys.argv[2], 'exec'))"
+        ),
+        str(rife_root), str(rife_root / "inference_video.py"),
         "--exp", str(exp), "--video", str(input_video), "--output", str(output_video),
         "--fps", str(max(1, int(round(fps * multiplier)))), "--scale", str(scale),
     ]
     print(f"[RIFE] Starting {multiplier}x interpolation at {fps * multiplier:.3f} FPS")
-    result = subprocess.run(cmd, cwd=str(rife_root), check=False)
+    result = subprocess.run(cmd, cwd=str(_project_root()), check=False)
     if result.returncode != 0 or not output_video.exists() or output_video.stat().st_size == 0:
         print(f"[RIFE] Interpolation failed with exit code {result.returncode}; keeping original render.")
         return False
@@ -120,8 +128,8 @@ def patch_ffmpeg_encoder() -> None:
     def start_process(self, output_filename: str, frame_width: int, frame_height: int, fps: float,
                       control: Mapping[str, Any], is_segment: bool = False, media_path: str | None = None,
                       start_time_sec: float = 0.0, end_time_sec: float = 0.0) -> bool:
-        result = original_start(self, output_filename, frame_width, frame_height, fps, control,
-                                is_segment, media_path, start_time_sec, end_time_sec)
+        result = original_start(self, output_filename, frame_width, frame_height, fps,
+                                control, is_segment, media_path, start_time_sec, end_time_sec)
         if result:
             mode = str(control.get("RIFEInterpolationSelection", "Off"))
             self._rife_multiplier = int(mode[:-1]) if mode.endswith("x") and mode[:-1].isdigit() else 1
