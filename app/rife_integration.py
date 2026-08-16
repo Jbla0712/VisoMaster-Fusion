@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, Signal
 
 _MODE_TO_EXP = {"Off": 0, "2x": 1, "4x": 2, "8x": 3}
 
@@ -110,7 +110,30 @@ class _RifePreviewEngine:
                 return [self._crop(x, (h, w)) for x in mids]
 
 
+class _RifePreviewDispatcher(QObject):
+    """Dispatch RIFE-generated preview frames onto the Qt GUI thread."""
+
+    show_frame = Signal(object, object, object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.show_frame.connect(self._show_frame)
+
+    @staticmethod
+    def _show_frame(main_window: Any, frame: np.ndarray, frame_number: int) -> None:
+        try:
+            from app.ui.widgets.actions import graphics_view_actions, common_actions
+
+            pixmap = common_actions.get_pixmap_from_frame(main_window, frame)
+            graphics_view_actions.update_graphics_view(
+                main_window, pixmap, frame_number
+            )
+        except Exception as exc:
+            print(f"[RIFE-PREVIEW] GUI dispatch failed: {exc}")
+
+
 _PREVIEW_ENGINE = _RifePreviewEngine()
+_PREVIEW_DISPATCHER = _RifePreviewDispatcher()
 
 
 def set_rife_interpolation(main_window: Any, value: str) -> None:
@@ -138,7 +161,6 @@ def install_settings(settings_layout_data: dict[str, Any]) -> None:
 def patch_preview_pipeline() -> None:
     """Attach RIFE between already-processed preview frames only."""
     from app.processors.video_processor import VideoProcessor
-    from app.ui.widgets.actions import graphics_view_actions, common_actions
 
     if getattr(VideoProcessor, "_rife_preview_patched", False):
         return
@@ -166,16 +188,14 @@ def patch_preview_pipeline() -> None:
             if not mids:
                 return result
 
-            delay_ms = max(1, int((getattr(self, "target_delay_sec", 1 / 30.0) * 1000) / factor))
-            for index, mid in enumerate(mids, start=1):
-                def show(frame=mid):
-                    if self.recording or self.is_processing_segments:
-                        return
-                    pixmap = common_actions.get_pixmap_from_frame(self.main_window, frame)
-                    graphics_view_actions.update_graphics_view(
-                        self.main_window, pixmap, next_number - 1
-                    )
-                QTimer.singleShot(delay_ms * index, show)
+            for mid in mids:
+                if self.recording or self.is_processing_segments:
+                    break
+                _PREVIEW_DISPATCHER.show_frame.emit(
+                    self.main_window,
+                    mid,
+                    next_number - 1,
+                )
 
             print(f"[RIFE-PREVIEW] queued {len(mids)} intermediate frame(s)")
         except Exception as exc:
