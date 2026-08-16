@@ -74,6 +74,14 @@ class _RifePreviewEngine:
         out = tensor[0, :, :h, :w].clamp(0, 1)
         return (out.mul(255.0).byte().permute(1, 2, 0).cpu().numpy()).copy()
 
+    def _infer(self, model: Any, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        """Call the HDv3 model using the API shipped by RIFE.
+
+        HDv3's Model.inference accepts (img0, img1, scale=...). It does not
+        accept the timestep keyword used by some newer RIFE wrappers.
+        """
+        return model.inference(first, second, scale=1.0)
+
     def interpolate(self, first: np.ndarray, second: np.ndarray, count: int) -> list[np.ndarray]:
         if count <= 0:
             return []
@@ -88,7 +96,7 @@ class _RifePreviewEngine:
                 def recurse(x: torch.Tensor, y: torch.Tensor, n: int) -> list[torch.Tensor]:
                     if n <= 0:
                         return []
-                    mid = model.inference(x, y, timestep=0.5, scale=1.0)
+                    mid = self._infer(model, x, y)
                     if n == 1:
                         return [mid]
                     half = n // 2
@@ -128,12 +136,7 @@ def install_settings(settings_layout_data: dict[str, Any]) -> None:
 
 
 def patch_preview_pipeline() -> None:
-    """Attach RIFE between already-processed preview frames.
-
-    The existing VideoProcessor remains responsible for decoding, processing,
-    recording and normal playback. RIFE only adds temporary GUI frames between
-    two processed frames, and is completely disabled while recording.
-    """
+    """Attach RIFE between already-processed preview frames only."""
     from app.processors.video_processor import VideoProcessor
     from app.ui.widgets.actions import graphics_view_actions, common_actions
 
@@ -163,9 +166,6 @@ def patch_preview_pipeline() -> None:
             if not mids:
                 return result
 
-            # The normal metronome has already scheduled the next source frame.
-            # Insert the intermediate frames on the same GUI event loop at evenly
-            # spaced offsets. They never enter the recording encoder.
             delay_ms = max(1, int((getattr(self, "target_delay_sec", 1 / 30.0) * 1000) / factor))
             for index, mid in enumerate(mids, start=1):
                 def show(frame=mid):
@@ -188,7 +188,6 @@ def patch_preview_pipeline() -> None:
 
 
 def patch_ffmpeg_encoder() -> None:
-    # Deliberately disabled: RIFE is preview-only now.
     return None
 
 
@@ -201,5 +200,4 @@ def cancel_rife_for_encoder(encoder: Any) -> None:
 
 
 def apply_rife_to_encoded_video(encoder: Any) -> None:
-    # Compatibility no-op: recording/export must never invoke RIFE.
     return None
