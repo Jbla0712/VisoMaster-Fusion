@@ -1,6 +1,6 @@
 absl-py==2.4.0
-aiohappyeyeballs==2.6.1
-aiohttp==3.13.5
+aihappyeyeballs==2.6.1
+ aiohttp==3.13.5
 aiosignal==1.4.0
 antlr4-python3-runtime==4.9.3
 astunparse==1.6.3
@@ -75,6 +75,7 @@ send2trash==2.1.0
 setuptools==81.0.0
 shiboken6==6.11.0
 six==1.17.0
+sk-video==1.1.10
 sympy==1.14.0
 tensorflow==2.21.0
 tensorrt-cu13==10.16.1.11
