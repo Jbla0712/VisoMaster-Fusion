@@ -258,6 +258,7 @@ def patch_preview_pipeline() -> None:
 
     VideoProcessor.display_next_frame = wrapped
     VideoProcessor._rife_preview_patched = True
+    VideoProcessor.processing_stopped_signal.connect(_PREVIEW_ENGINE.cancel)
     print("[RIFE-PREVIEW] Throttled async preview pipeline installed (recording/export untouched)")
 
 
