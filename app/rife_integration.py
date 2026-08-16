@@ -34,7 +34,6 @@ def _download(url: str, destination: Path) -> None:
 
 
 def ensure_rife_installation() -> Path:
-    """Download the official RIFE source and a compatible pretrained HD model once."""
     root = _rife_root()
     if (root / "inference_video.py").exists() and (root / "train_log").exists():
         return root
@@ -74,15 +73,19 @@ def _run_rife(input_video: Path, output_video: Path, multiplier: int, fps: float
     rife_root = ensure_rife_installation()
     exp = _MODE_TO_EXP.get(f"{multiplier}x", 1)
     scale = 0.5 if _video_is_4k_or_higher(input_video) else 1.0
+    compat = (
+        "import sys; "
+        "from app.rife_numpy_compat import patch_legacy_numpy_aliases; "
+        "patch_legacy_numpy_aliases(); "
+        "sys.path.insert(0, sys.argv.pop(1)); "
+        "sys.argv[0] = sys.argv[1]; "
+        "sys.argv.pop(1); "
+        "exec(compile(open(sys.argv[0], encoding='utf-8').read(), sys.argv[0], 'exec'))"
+    )
+    # Keep the RIFE script path outside its argparse arguments.  The previous
+    # launcher accidentally exposed the two internal paths as CLI arguments.
     cmd = [
-        sys.executable, "-c",
-        (
-            "import sys; "
-            "from app.rife_numpy_compat import patch_legacy_numpy_aliases; "
-            "patch_legacy_numpy_aliases(); "
-            "sys.path.insert(0, sys.argv[1]); "
-            "exec(compile(open(sys.argv[2], encoding='utf-8').read(), sys.argv[2], 'exec'))"
-        ),
+        sys.executable, "-c", compat,
         str(rife_root), str(rife_root / "inference_video.py"),
         "--exp", str(exp), "--video", str(input_video), "--output", str(output_video),
         "--fps", str(max(1, int(round(fps * multiplier)))), "--scale", str(scale),
