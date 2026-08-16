@@ -23,12 +23,25 @@ def _rife_root() -> Path:
 
 
 class _RifePreviewEngine:
-    """Lazy RIFE engine used only by the GUI preview path."""
+    """Lazy RIFE engine used only by the GUI preview path.
+
+    RIFE inference is deliberately kept off the video-processing thread. The
+    preview worker keeps only the newest request so a slow GPU inference can
+    never build an unbounded backlog and stall playback.
+    """
 
     def __init__(self) -> None:
         self.model: Any | None = None
         self.lock = threading.Lock()
         self.loaded = False
+        self._condition = threading.Condition()
+        self._pending: tuple[np.ndarray, np.ndarray, int, Any, int] | None = None
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="RIFE-Preview-Worker",
+            daemon=True,
+        )
+        self._worker.start()
 
     def _load(self) -> Any:
         if self.model is not None:
@@ -75,11 +88,7 @@ class _RifePreviewEngine:
         return (out.mul(255.0).byte().permute(1, 2, 0).cpu().numpy()).copy()
 
     def _infer(self, model: Any, first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
-        """Call the HDv3 model using the API shipped by RIFE.
-
-        HDv3's Model.inference accepts (img0, img1, scale=...). It does not
-        accept the timestep keyword used by some newer RIFE wrappers.
-        """
+        """Call the HDv3 model using the API shipped by RIFE."""
         return model.inference(first, second, scale=1.0)
 
     def interpolate(self, first: np.ndarray, second: np.ndarray, count: int) -> list[np.ndarray]:
@@ -109,6 +118,55 @@ class _RifePreviewEngine:
                 mids = recurse(a, b, count)
                 return [self._crop(x, (h, w)) for x in mids]
 
+    def enqueue(
+        self,
+        first: np.ndarray,
+        second: np.ndarray,
+        count: int,
+        main_window: Any,
+        frame_number: int,
+    ) -> None:
+        if count <= 0:
+            return
+        request = (
+            np.ascontiguousarray(first[:, :, :3]).copy(),
+            np.ascontiguousarray(second[:, :, :3]).copy(),
+            count,
+            main_window,
+            frame_number,
+        )
+        with self._condition:
+            replaced = self._pending is not None
+            self._pending = request
+            self._condition.notify()
+        if replaced:
+            print("[RIFE-PREVIEW] Dropped stale interpolation request")
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None:
+                    self._condition.wait()
+                request = self._pending
+                self._pending = None
+
+            if request is None:
+                continue
+            first, second, count, main_window, frame_number = request
+            try:
+                mids = self.interpolate(first, second, count)
+                if not mids:
+                    continue
+                for mid in mids:
+                    _PREVIEW_DISPATCHER.show_frame.emit(
+                        main_window,
+                        mid,
+                        frame_number,
+                    )
+                print(f"[RIFE-PREVIEW] queued {len(mids)} intermediate frame(s)")
+            except Exception as exc:
+                print(f"[RIFE-PREVIEW] Worker error: {exc}")
+
 
 class _RifePreviewDispatcher(QObject):
     """Dispatch RIFE-generated preview frames onto the Qt GUI thread."""
@@ -132,8 +190,8 @@ class _RifePreviewDispatcher(QObject):
             print(f"[RIFE-PREVIEW] GUI dispatch failed: {exc}")
 
 
-_PREVIEW_ENGINE = _RifePreviewEngine()
 _PREVIEW_DISPATCHER = _RifePreviewDispatcher()
+_PREVIEW_ENGINE = _RifePreviewEngine()
 
 
 def set_rife_interpolation(main_window: Any, value: str) -> None:
@@ -159,7 +217,7 @@ def install_settings(settings_layout_data: dict[str, Any]) -> None:
 
 
 def patch_preview_pipeline() -> None:
-    """Attach RIFE between already-processed preview frames only."""
+    """Attach asynchronous RIFE interpolation between preview frames only."""
     from app.processors.video_processor import VideoProcessor
 
     if getattr(VideoProcessor, "_rife_preview_patched", False):
@@ -183,28 +241,24 @@ def patch_preview_pipeline() -> None:
             if next_frame is None:
                 return result
 
-            print(f"[RIFE-PREVIEW] {selection}: interpolating frame {next_number - 1} -> {next_number}")
-            mids = _PREVIEW_ENGINE.interpolate(self.current_frame, next_frame, factor - 1)
-            if not mids:
-                return result
-
-            for mid in mids:
-                if self.recording or self.is_processing_segments:
-                    break
-                _PREVIEW_DISPATCHER.show_frame.emit(
-                    self.main_window,
-                    mid,
-                    next_number - 1,
-                )
-
-            print(f"[RIFE-PREVIEW] queued {len(mids)} intermediate frame(s)")
+            print(
+                f"[RIFE-PREVIEW] {selection}: queueing frame "
+                f"{next_number - 1} -> {next_number}"
+            )
+            _PREVIEW_ENGINE.enqueue(
+                self.current_frame,
+                next_frame,
+                factor - 1,
+                self.main_window,
+                next_number - 1,
+            )
         except Exception as exc:
             print(f"[RIFE-PREVIEW] Disabled for this frame after error: {exc}")
         return result
 
     VideoProcessor.display_next_frame = wrapped
     VideoProcessor._rife_preview_patched = True
-    print("[RIFE-PREVIEW] Preview pipeline installed (recording/export untouched)")
+    print("[RIFE-PREVIEW] Async preview pipeline installed (recording/export untouched)")
 
 
 def patch_ffmpeg_encoder() -> None:
