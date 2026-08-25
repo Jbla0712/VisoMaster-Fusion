@@ -6,11 +6,7 @@ from pathlib import Path
 
 
 def _write_crash_log(exc: BaseException) -> Path:
-    """Persist a full traceback to disk so the diagnostic survives even if the
-    console window closes before the user can copy it.
-
-    Returns the path of the written log so the caller can print it.
-    """
+    """Persist a full traceback to disk so the diagnostic survives even if the console window closes before the user can copy it."""
     log_dir = Path(__file__).resolve().parent / "crash_logs"
     log_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -20,7 +16,6 @@ def _write_crash_log(exc: BaseException) -> Path:
         f.write("=" * 70 + "\n")
         try:
             import platform
-
             f.write(f"Python:   {sys.version}\n")
             f.write(f"Platform: {platform.platform()}\n")
         except Exception:
@@ -31,51 +26,43 @@ def _write_crash_log(exc: BaseException) -> Path:
 
 
 def _run_app() -> None:
-    """Boot the Qt app. Imports are inside the function so any startup error is
-    captured by the outer try/except (otherwise a top-level import error would
-    bypass the crash-log writer)."""
-    # IMPORTANT: the portable launcher starts this file directly. The old
-    # integration was installed in launcher.py, which is only the launcher UI
-    # and therefore never ran when the actual VisoMaster process was spawned.
-    # Install the source before importing MainWindow so the media UI hooks are
-    # present when Qt widgets are constructed.
     if sys.platform == "win32":
         try:
             from app.processors.screen_capture_integration import install as install_screen_capture
-
             install_screen_capture()
         except Exception as exc:
             print(f"[WARN] Screen capture integration could not be initialized: {exc}")
 
     from app.ui import main_ui
-    from PySide6 import QtWidgets
+    from PySide6 import QtWidgets, QtCore
 
     import qdarktheme
     from app.ui.core.proxy_style import ProxyStyle
 
     parser = argparse.ArgumentParser(description="VisoMaster")
-    parser.add_argument(
-        "--gpu-id",
-        type=int,
-        default=0,
-        help="CUDA GPU device ID to use (default: 0)",
-    )
+    parser.add_argument("--gpu-id", type=int, default=0, help="CUDA GPU device ID to use (default: 0)")
     args, remaining = parser.parse_known_args()
 
     app = QtWidgets.QApplication(remaining)
     app.setStyle(ProxyStyle())
     with open("app/ui/styles/true_dark_styles.qss", "r") as f:
         _style = f.read()
-        _style = (
-            qdarktheme.load_stylesheet(
-                theme="dark", custom_colors={"primary": "#4090a3"}
-            )
-            + "\n"
-            + _style
-        )
+        _style = qdarktheme.load_stylesheet(theme="dark", custom_colors={"primary": "#4090a3"}) + "\n" + _style
         app.setStyleSheet(_style)
+
     window = main_ui.MainWindow(gpu_id=args.gpu_id)
     window.show()
+
+    # Explicit post-construction hook. This is intentionally independent of
+    # MainWindow.__init__ monkey-patching: it runs after every widget/list has
+    # actually been created and therefore guarantees the card can be inserted.
+    if sys.platform == "win32":
+        try:
+            from app.processors.screen_capture_integration import add_screen_capture_card
+            QtCore.QTimer.singleShot(0, lambda: add_screen_capture_card(window))
+        except Exception as exc:
+            print(f"[WARN] Screen Capture UI hook could not be scheduled: {exc}")
+
     app.exec()
 
 
