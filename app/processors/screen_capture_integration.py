@@ -63,6 +63,7 @@ class ScreenCaptureSource:
         self._opened = True
         self._next_capture_time = 0.0
         self._logged_first_frame = False
+        self._frame_count = 0
 
     @property
     def width(self): return self.monitor.width
@@ -81,9 +82,12 @@ class ScreenCaptureSource:
             image = ImageGrab.grab(bbox=(self.monitor.left, self.monitor.top, self.monitor.right, self.monitor.bottom), all_screens=True)
             rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
             frame = np.ascontiguousarray(rgb[:, :, ::-1])
+            self._frame_count += 1
             if not self._logged_first_frame:
                 print(f"[INFO] Screen Capture first frame acquired: {frame.shape[1]}x{frame.shape[0]}")
                 self._logged_first_frame = True
+            elif self._frame_count % 30 == 0:
+                print(f"[INFO] Screen Capture frame #{self._frame_count} acquired")
             return True, frame
         except Exception as exc:
             print(f"[ERROR] Screen capture failed: {exc}")
@@ -103,8 +107,8 @@ class ScreenCaptureSource:
         return 0.0
 
     def set(self, *_args):
-        # VideoProcessor's live-source path performs a harmless frame seek on startup.
-        # Desktop capture is continuous, so treat it as a successful no-op.
+        # Desktop capture has no seek position. VideoProcessor may call this
+        # while preparing the live source; it is intentionally a no-op.
         return True
 
     def open(self, *_args): self._opened = True; return True
@@ -121,12 +125,7 @@ def _thumbnail():
 
 
 def _load_screen(self):
-    """Load desktop capture as a webcam-compatible live source.
-
-    The VideoProcessor webcam pipeline is used only as a generic live-source
-    feeder. No cv2.VideoCapture is created and the physical webcam is never
-    opened; media_capture remains our ScreenCaptureSource instance.
-    """
+    """Load desktop capture without ever opening the physical webcam."""
     mw = self.main_window
     vp = mw.video_processor
     try:
@@ -147,11 +146,12 @@ def _load_screen(self):
         vp.media_capture = source
         vp.media_rotation = 0
         vp.media_path = "screen://monitor"
-        # IMPORTANT: use the existing live/webcam processing path without using
-        # TargetMedia's webcam loader. That loader is what opens cv2.VideoCapture.
-        vp.file_type = "webcam"
+        # Keep this distinct from the public webcam source. The process_video
+        # hook below temporarily exposes it as a video to reuse the mature
+        # continuous feeder/metronome without invoking cv2.VideoCapture.
+        vp.file_type = "screen"
         vp.fps = source.fps
-        vp.max_frame_number = 999999999
+        vp.max_frame_number = 2147483647
         vp.current_frame_number = 0
         vp.next_frame_to_display = 0
         vp.current_frame = frame
@@ -161,14 +161,60 @@ def _load_screen(self):
         pixmap = common_actions.get_pixmap_from_frame(mw, frame)
         graphics_view_actions.update_graphics_view(mw, pixmap, 0, reset_fit=True)
         self.reset_related_widgets_and_values()
-        mw.videoSeekSlider.setMaximum(999999999)
+        mw.videoSeekSlider.setMaximum(2147483647)
         mw.videoSeekSlider.setValue(0)
         mw.selected_video_button = self
         mw.loading_new_media = True
         common_actions.refresh_frame(mw, synchronous=True)
-        print(f"[INFO] Screen Capture active: monitor={source.monitor_index + 1}, {source.width}x{source.height}, {source.fps:g} FPS (live-source pipeline)")
+        print(f"[INFO] Screen Capture active: monitor={source.monitor_index + 1}, {source.width}x{source.height}, {source.fps:g} FPS")
     except Exception as exc:
         print(f"[ERROR] Could not initialize screen capture: {exc}")
+
+
+def _install_process_video_hook():
+    """Allow the existing video feeder to consume the continuous screen source.
+
+    We deliberately do this at the VideoProcessor boundary instead of changing
+    the core processor. Screen capture is still tagged as ``screen`` at rest;
+    only while processing is started is it presented as a never-ending video
+    source. This avoids the webcam-specific display queue and its single-frame
+    startup behavior, while still never constructing cv2.VideoCapture.
+    """
+    from app.processors.video_processor import VideoProcessor
+
+    original = VideoProcessor.process_video
+    if getattr(original, "_screen_capture_original", False):
+        return
+
+    def process_video(self, *args, **kwargs):
+        if not getattr(self, "_screen_capture_active", False):
+            return original(self, *args, **kwargs)
+
+        source = getattr(self, "_screen_capture_source", None)
+        if source is None or not source.isOpened():
+            print("[ERROR] Screen Capture process requested but source is not open.")
+            return
+
+        previous_file_type = self.file_type
+        previous_preroll = self.preroll_target
+        previous_max_buffer = self.max_display_buffer_size
+        try:
+            # process_video() intentionally accepts only video files. Present
+            # the live desktop source as an endless video for that function and
+            # its feeder. media_capture remains ScreenCaptureSource throughout.
+            self.file_type = "video"
+            self.preroll_target = 1
+            self.max_display_buffer_size = max(4, self.num_threads * 3)
+            print("[INFO] Screen Capture: starting continuous video feeder")
+            return original(self, *args, **kwargs)
+        except Exception as exc:
+            print(f"[ERROR] Screen Capture processing failed: {exc}")
+            self.file_type = previous_file_type
+            self.preroll_target = previous_preroll
+            self.max_display_buffer_size = previous_max_buffer
+
+    process_video._screen_capture_original = True
+    VideoProcessor.process_video = process_video
 
 
 def add_screen_capture_card(mw):
@@ -246,6 +292,7 @@ def _install_window_hook():
 
 def install():
     if not IS_WINDOWS: return
+    _install_process_video_hook()
     _install_target_hook()
     _install_window_hook()
     print("[INFO] Windows Screen Capture integration installed.")
