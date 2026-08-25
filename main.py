@@ -34,6 +34,19 @@ def _run_app() -> None:
     """Boot the Qt app. Imports are inside the function so any startup error is
     captured by the outer try/except (otherwise a top-level import error would
     bypass the crash-log writer)."""
+    # IMPORTANT: the portable launcher starts this file directly. The old
+    # integration was installed in launcher.py, which is only the launcher UI
+    # and therefore never ran when the actual VisoMaster process was spawned.
+    # Install the source before importing MainWindow so the media UI hooks are
+    # present when Qt widgets are constructed.
+    if sys.platform == "win32":
+        try:
+            from app.processors.screen_capture_integration import install as install_screen_capture
+
+            install_screen_capture()
+        except Exception as exc:
+            print(f"[WARN] Screen capture integration could not be initialized: {exc}")
+
     from app.ui import main_ui
     from PySide6 import QtWidgets
 
