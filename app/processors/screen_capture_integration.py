@@ -251,6 +251,9 @@ def _install_target_media_source() -> None:
 
     def load_media(self):
         if self.file_type != "screen":
+            current_vp = getattr(self.main_window, "video_processor", None)
+            if current_vp is not None:
+                current_vp._screen_capture_source = None
             return original_load_media(self)
 
         main_window = self.main_window
@@ -258,6 +261,10 @@ def _install_target_media_source() -> None:
             return
 
         vp = main_window.video_processor
+        if main_window.selected_video_button and main_window.selected_video_button is not self:
+            main_window.selected_video_button.blockSignals(True)
+            main_window.selected_video_button.setChecked(False)
+            main_window.selected_video_button.blockSignals(False)
         if vp.processing:
             vp.stop_processing()
 
