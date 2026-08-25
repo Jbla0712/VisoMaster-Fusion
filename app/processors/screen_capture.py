@@ -1,29 +1,19 @@
-"""Native Windows screen capture source.
+"""Low-latency Windows display capture using DXGI Desktop Duplication.
 
-Uses Windows Graphics Capture through the WinRT Python projection. Frames are
-returned as BGR numpy arrays so they can be fed into VisoMaster's existing live
-processing pipeline. This module intentionally has no dependency on OBS.
+This is a direct screen-capture path, similar to OBS Display Capture: it does
+not use a webcam and does not go through an OBS virtual camera.
 """
 from __future__ import annotations
 
-import queue
-import threading
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 try:
-    from winrt.windows.graphics.capture import (
-        Direct3D11CaptureFramePool,
-        GraphicsCaptureItem,
-        GraphicsCaptureSession,
-    )
-    from winrt.windows.graphics.directx.direct3d11 import IDirect3DDevice
-    _WINRT_AVAILABLE = True
-except ImportError:
-    _WINRT_AVAILABLE = False
+    import dxcam
+except ImportError:  # pragma: no cover - Windows optional dependency
+    dxcam = None
 
 
 @dataclass(frozen=True)
@@ -39,91 +29,70 @@ class ScreenCaptureError(RuntimeError):
 
 
 class ScreenCapture:
-    """Capture a Windows display without OBS or a virtual camera."""
+    """Direct Windows DXGI display capture returning BGR numpy frames."""
 
     def __init__(self, monitor_index: int = 0, fps: float = 30.0):
-        if not _WINRT_AVAILABLE:
+        if dxcam is None:
             raise ScreenCaptureError(
-                "Windows Graphics Capture support is not installed. "
-                "Install the WinRT dependencies from requirements.txt."
+                "dxcam is required for Windows screen capture. Install dxcam."
             )
-        self.monitor_index = monitor_index
+        self.monitor_index = int(monitor_index)
         self.fps = max(1.0, float(fps))
-        self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=2)
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._last_frame: Optional[np.ndarray] = None
+        self._camera = None
+        self._running = False
 
     @staticmethod
     def available() -> bool:
-        return _WINRT_AVAILABLE
+        return dxcam is not None
 
     @staticmethod
     def list_monitors() -> list[ScreenInfo]:
-        """Return physical displays using the Windows display API."""
-        if not _WINRT_AVAILABLE:
+        """Return displays visible to the DXGI capture backend."""
+        if dxcam is None:
             return []
-        # The actual GraphicsCaptureItem picker is intentionally kept out of the
-        # worker. The UI can provide a monitor index; pywin32 supplies stable
-        # monitor geometry without taking a screenshot.
+        result: list[ScreenInfo] = []
         try:
-            import win32api
-            result: list[ScreenInfo] = []
-            for i, monitor in enumerate(win32api.EnumDisplayMonitors()):
-                handle, _, rect = monitor
-                left, top, right, bottom = rect
-                result.append(ScreenInfo(i, f"Display {i + 1}", right-left, bottom-top))
-            return result
+            devices = dxcam.device_info()
+            for i, monitor in enumerate(devices):
+                width = int(monitor.get("Width", monitor.get("width", 0)))
+                height = int(monitor.get("Height", monitor.get("height", 0)))
+                name = str(monitor.get("Device", f"Display {i + 1}"))
+                result.append(ScreenInfo(i, name, width, height))
         except Exception:
-            return []
+            # Keep the capture backend usable even when dxcam changes its
+            # optional device-info API. The monitor can still be selected by index.
+            result = []
+        return result
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._running:
             return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._capture_loop, name="ScreenCapture", daemon=True)
-        self._thread.start()
+        try:
+            self._camera = dxcam.create(
+                output_idx=self.monitor_index,
+                output_color="BGR",
+            )
+            self._camera.start(target_fps=self.fps, video_mode=True)
+            self._running = True
+        except Exception as exc:
+            self._camera = None
+            raise ScreenCaptureError(f"Unable to start display capture: {exc}") from exc
+
+    def read(self) -> Optional[np.ndarray]:
+        if not self._running or self._camera is None:
+            return None
+        frame = self._camera.get_latest_frame()
+        if frame is None:
+            return None
+        return np.asarray(frame)
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=1.0)
-        self._thread = None
-        self._clear_queue()
-
-    def read(self, timeout: float = 0.25) -> Optional[np.ndarray]:
-        try:
-            frame = self._queue.get(timeout=timeout)
-            self._last_frame = frame
-            return frame
-        except queue.Empty:
-            return self._last_frame
-
-    def _clear_queue(self) -> None:
-        while True:
+        if self._camera is not None:
             try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                return
-
-    def _capture_loop(self) -> None:
-        """Capture loop placeholder for the WinRT D3D11 interop path.
-
-        WinRT GraphicsCaptureItem objects are apartment-bound and require a
-        D3D11 device created by the application's graphics stack. The helper
-        below is isolated so the rest of VisoMaster remains backend-neutral.
-        """
-        try:
-            self._capture_winrt()
-        except Exception:
-            # Never crash the GUI thread because a monitor disappears or the
-            # capture permission changes. The caller observes an empty stream.
-            self._stop.set()
-
-    def _capture_winrt(self) -> None:
-        raise ScreenCaptureError(
-            "Windows Graphics Capture D3D11 interop is unavailable in this build."
-        )
+                self._camera.stop()
+            finally:
+                self._camera = None
+        self._running = False
 
     def __enter__(self) -> "ScreenCapture":
         self.start()
