@@ -91,6 +91,6 @@ typing-extensions==4.15.0
 urllib3==2.6.3
 wcwidth==0.7.0
 wheel==0.47.0
-windows-capture==1.5.0
+windows-capture==2.0.1
 wrapt==2.1.2
 yarl==1.23.0
