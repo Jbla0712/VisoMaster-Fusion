@@ -28,6 +28,15 @@ _repo_root = Path(__file__).resolve().parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+# Install optional Windows Screen Capture before the Qt application imports its
+# media widgets. The integration is a no-op on non-Windows systems.
+try:
+    from app.processors.screen_capture_integration import install as install_screen_capture
+
+    install_screen_capture()
+except Exception as exc:
+    print(f"[WARN] Screen capture integration could not be initialized: {exc}")
+
 from app.ui.launcher.main import main  # noqa: E402
 
 if __name__ == "__main__":
