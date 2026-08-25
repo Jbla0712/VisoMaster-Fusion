@@ -54,14 +54,33 @@ def enumerate_monitors() -> list[MonitorInfo]:
     _make_dpi_aware()
 
     class RECT(ctypes.Structure):
-        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
 
     monitors: list[MonitorInfo] = []
-    callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(RECT), ctypes.c_ssize_t)
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(RECT),
+        ctypes.c_ssize_t,
+    )
 
     def callback(_monitor, _dc, rect_ptr, _data):
         rect = rect_ptr.contents
-        monitors.append(MonitorInfo(len(monitors), int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)))
+        monitors.append(
+            MonitorInfo(
+                len(monitors),
+                int(rect.left),
+                int(rect.top),
+                int(rect.right),
+                int(rect.bottom),
+            )
+        )
         return 1
 
     cb = callback_type(callback)
@@ -70,7 +89,7 @@ def enumerate_monitors() -> list[MonitorInfo]:
 
 
 class ScreenCaptureSource:
-    """Lightweight Windows monitor capture with the interface VisoMaster's live pipeline needs."""
+    """Live monitor capture exposing the same read/isOpened/release/get API used by VisoMaster's webcam path."""
 
     def __init__(self, monitor_index: int = 0, fps: float = 30.0):
         if not IS_WINDOWS:
@@ -103,7 +122,12 @@ class ScreenCaptureSource:
         self._next_capture_time = time.perf_counter() + interval
         try:
             image = ImageGrab.grab(
-                bbox=(self.monitor.left, self.monitor.top, self.monitor.right, self.monitor.bottom),
+                bbox=(
+                    self.monitor.left,
+                    self.monitor.top,
+                    self.monitor.right,
+                    self.monitor.bottom,
+                ),
                 all_screens=True,
             )
             rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
@@ -156,150 +180,199 @@ def _fps_from_control(main_window) -> float:
 
 def _screen_thumbnail(main_window):
     from PySide6 import QtGui
-    source = ScreenCaptureSource(_monitor_index_from_control(main_window), _fps_from_control(main_window))
+
+    source = ScreenCaptureSource(
+        _monitor_index_from_control(main_window), _fps_from_control(main_window)
+    )
     ok, frame_bgr = source.read()
     source.release()
     if not ok or frame_bgr is None:
         return None
     h, w = frame_bgr.shape[:2]
-    return QtGui.QImage(frame_bgr.data, w, h, int(frame_bgr.strides[0]), QtGui.QImage.Format.Format_BGR888).copy()
+    return QtGui.QImage(
+        frame_bgr.data,
+        w,
+        h,
+        int(frame_bgr.strides[0]),
+        QtGui.QImage.Format.Format_BGR888,
+    ).copy()
 
 
 def _install_settings() -> None:
     from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
+
     general = SETTINGS_LAYOUT_DATA.setdefault("General", {})
     monitors = enumerate_monitors()
     options = [m.label for m in monitors] or ["Monitor 1"]
-    general.setdefault("ScreenCaptureMonitorSelection", {
-        "level": 1,
-        "label": "Screen Capture Monitor",
-        "options": options,
-        "default": options[0],
-        "help": "Monitor used by the Windows Screen Capture source.",
-    })
-    general.setdefault("ScreenCaptureFpsSlider", {
-        "level": 1,
-        "label": "Screen Capture FPS",
-        "min_value": "5",
-        "max_value": "120",
-        "default": "30",
-        "step": 1,
-        "help": "Capture rate used by Windows Screen Capture.",
-    })
+    general.setdefault(
+        "ScreenCaptureMonitorSelection",
+        {
+            "level": 1,
+            "label": "Screen Capture Monitor",
+            "options": options,
+            "default": options[0],
+            "help": "Monitor used by the Windows Screen Capture source.",
+        },
+    )
+    general.setdefault(
+        "ScreenCaptureFpsSlider",
+        {
+            "level": 1,
+            "label": "Screen Capture FPS",
+            "min_value": "5",
+            "max_value": "120",
+            "default": "30",
+            "step": 1,
+            "help": "Capture rate used by Windows Screen Capture.",
+        },
+    )
+
+
+def _load_screen_media(self):
+    """TargetMediaCardButton handler for the synthetic Screen Capture item."""
+    main_window = self.main_window
+    vp = main_window.video_processor
+    try:
+        if (
+            main_window.selected_video_button
+            and main_window.selected_video_button is not self
+        ):
+            main_window.selected_video_button.blockSignals(True)
+            main_window.selected_video_button.setChecked(False)
+            main_window.selected_video_button.blockSignals(False)
+
+        vp.stop_processing()
+        vp._clear_single_frame_preview_caches()
+        source = ScreenCaptureSource(
+            _monitor_index_from_control(main_window), _fps_from_control(main_window)
+        )
+        ok, frame_bgr = source.read()
+        if not ok or frame_bgr is None:
+            source.release()
+            raise RuntimeError("Unable to capture the selected monitor.")
+
+        if vp.media_capture:
+            try:
+                vp.media_capture.release()
+            except Exception:
+                pass
+
+        vp._screen_capture_source = source
+        vp.media_capture = source
+        vp.media_rotation = 0
+        vp.media_path = "screen://monitor"
+        # The existing live pipeline is selected by the webcam file type.
+        vp.file_type = "webcam"
+        vp.fps = source.fps
+        vp.max_frame_number = 999999999
+        vp.current_frame_number = 0
+        vp.next_frame_to_display = 0
+        vp.current_frame = frame_bgr
+
+        main_window.parameters = {}
+        main_window.selected_target_face_id = None
+        main_window.scene.clear()
+        from app.ui.widgets.actions import common_actions, graphics_view_actions
+
+        pixmap = common_actions.get_pixmap_from_frame(main_window, frame_bgr)
+        graphics_view_actions.update_graphics_view(
+            main_window, pixmap, 0, reset_fit=True
+        )
+
+        self.reset_related_widgets_and_values()
+        main_window.videoSeekSlider.blockSignals(True)
+        main_window.videoSeekSlider.setMaximum(999999999)
+        main_window.videoSeekSlider.setValue(0)
+        main_window.videoSeekSlider.blockSignals(False)
+        self._toggle_timeline_visibility(main_window, True)
+        main_window.selected_video_button = self
+        main_window.graphicsViewFrame.update()
+        main_window.loading_new_media = True
+        common_actions.refresh_frame(main_window, synchronous=True)
+        print("[INFO] Screen Capture selected.")
+    except Exception as exc:
+        print(f"[ERROR] Could not initialize screen capture: {exc}")
+        try:
+            vp.stop_processing()
+        except Exception:
+            pass
+
+
+def _add_screen_capture_card(main_window) -> None:
+    """Add a real clickable card after MainWindow has built all target-media UI."""
+    if not IS_WINDOWS:
+        return
+    if "screen-capture" in main_window.target_videos:
+        return
+
+    image = _screen_thumbnail(main_window)
+    if image is None:
+        print("[WARN] Screen Capture thumbnail could not be created.")
+        return
+
+    from app.ui.widgets import widget_components
+    from app.ui.widgets.actions import list_view_actions
+
+    list_view_actions.add_media_thumbnail_button(
+        main_window,
+        widget_components.TargetMediaCardButton,
+        main_window.targetVideosList,
+        main_window.target_videos,
+        image,
+        media_path="Screen Capture",
+        file_type="screen",
+        media_id="screen-capture",
+    )
+    print("[INFO] Screen Capture source added to Target Media.")
 
 
 def _install_target_media_source() -> None:
     from app.ui.widgets import widget_components
-    from app.ui.widgets.actions import list_view_actions
 
     original_load_media = widget_components.TargetMediaCardButton.load_media
-    original_load_target_webcams = list_view_actions.load_target_webcams
-
-    def load_media(self):
-        if self.file_type != "screen":
+    if not getattr(original_load_media, "_screen_capture_original", False):
+        def load_media(self):
+            if self.file_type == "screen":
+                return _load_screen_media(self)
             return original_load_media(self)
 
-        main_window = self.main_window
-        vp = main_window.video_processor
+        load_media._screen_capture_original = True
+        widget_components.TargetMediaCardButton.load_media = load_media
+
+    # Do not depend on the webcam loader being called. MainWindow construction
+    # is the reliable lifecycle point for this synthetic media source.
+    from app.ui.main_ui import MainWindow
+
+    original_init = MainWindow.__init__
+    if getattr(original_init, "_screen_capture_original", False):
+        return
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
         try:
-            if main_window.selected_video_button and main_window.selected_video_button is not self:
-                main_window.selected_video_button.blockSignals(True)
-                main_window.selected_video_button.setChecked(False)
-                main_window.selected_video_button.blockSignals(False)
-
-            vp.stop_processing()
-            vp._clear_single_frame_preview_caches()
-            source = ScreenCaptureSource(_monitor_index_from_control(main_window), _fps_from_control(main_window))
-            ok, frame_bgr = source.read()
-            if not ok or frame_bgr is None:
-                raise RuntimeError("Unable to capture the selected monitor.")
-
-            if vp.media_capture:
-                try:
-                    vp.media_capture.release()
-                except Exception:
-                    pass
-
-            vp._screen_capture_source = source
-            vp.media_capture = source
-            vp.media_rotation = 0
-            vp.media_path = "screen://monitor"
-            vp.file_type = "webcam"
-            vp.fps = source.fps
-            vp.max_frame_number = 999999999
-            vp.current_frame_number = 0
-            vp.next_frame_to_display = 0
-            vp.current_frame = frame_bgr
-
-            main_window.parameters = {}
-            main_window.selected_target_face_id = None
-            main_window.scene.clear()
-            from app.ui.widgets.actions import common_actions, graphics_view_actions
-            pixmap = common_actions.get_pixmap_from_frame(main_window, frame_bgr)
-            graphics_view_actions.update_graphics_view(main_window, pixmap, 0, reset_fit=True)
-
-            self.reset_related_widgets_and_values()
-            vp.file_type = "webcam"
-            main_window.videoSeekSlider.blockSignals(True)
-            main_window.videoSeekSlider.setMaximum(999999999)
-            main_window.videoSeekSlider.setValue(0)
-            main_window.videoSeekSlider.blockSignals(False)
-            self._toggle_timeline_visibility(main_window, True)
-            main_window.selected_video_button = self
-            main_window.graphicsViewFrame.update()
-            main_window.loading_new_media = True
-            common_actions.refresh_frame(main_window, synchronous=True)
+            _add_screen_capture_card(self)
         except Exception as exc:
-            print(f"[ERROR] Could not initialize screen capture: {exc}")
-            try:
-                vp.stop_processing()
-            except Exception:
-                pass
+            print(f"[WARN] Could not add Screen Capture card: {exc}")
 
-    def load_target_webcams(main_window, *args, **kwargs):
-        # Keep the normal webcam loader untouched.
-        original_load_target_webcams(main_window, *args, **kwargs)
-        if not IS_WINDOWS:
-            return
-
-        existing = main_window.target_videos.get("screen-capture")
-        if existing is not None:
-            try:
-                existing.remove_target_media_from_list()
-            except Exception:
-                main_window.target_videos.pop("screen-capture", None)
-
-        image = _screen_thumbnail(main_window)
-        if image is None:
-            print("[WARN] Screen Capture thumbnail could not be created.")
-            return
-
-        # Always show Screen Capture, even when the Webcam filter checkbox is off.
-        list_view_actions.add_media_thumbnail_button(
-            main_window,
-            widget_components.TargetMediaCardButton,
-            main_window.targetVideosList,
-            main_window.target_videos,
-            image,
-            media_path="Screen Capture",
-            file_type="screen",
-            media_id="screen-capture",
-        )
-        print("[INFO] Screen Capture source added to Target Media.")
-
-    widget_components.TargetMediaCardButton.load_media = load_media
-    list_view_actions.load_target_webcams = load_target_webcams
+    init._screen_capture_original = True
+    MainWindow.__init__ = init
 
 
 def _install_video_processor_hooks() -> None:
     from app.processors.video_processor import VideoProcessor
+
     original_stop = VideoProcessor.stop_processing
+    if getattr(original_stop, "_screen_capture_original", False):
+        return
 
     def stop_processing(self, *args, **kwargs):
         result = original_stop(self, *args, **kwargs)
-        if getattr(self, "_screen_capture_source", None) is not None and getattr(self, "file_type", None) == "webcam":
+        if getattr(self, "_screen_capture_source", None) is not None:
             try:
-                source = ScreenCaptureSource(_monitor_index_from_control(self.main_window), _fps_from_control(self.main_window))
+                source = ScreenCaptureSource(
+                    _monitor_index_from_control(self.main_window),
+                    _fps_from_control(self.main_window),
+                )
                 self._screen_capture_source = source
                 self.media_capture = source
                 self.media_rotation = 0
@@ -309,6 +382,7 @@ def _install_video_processor_hooks() -> None:
                 print(f"[WARN] Could not re-open screen capture after stop: {exc}")
         return result
 
+    stop_processing._screen_capture_original = True
     VideoProcessor.stop_processing = stop_processing
 
 
