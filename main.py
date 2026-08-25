@@ -34,6 +34,11 @@ def _run_app() -> None:
     """Boot the Qt app. Imports are inside the function so any startup error is
     captured by the outer try/except (otherwise a top-level import error would
     bypass the crash-log writer)."""
+    # Install optional live-source integrations before importing MainWindow so
+    # its webcam/source classes are patched before the UI is constructed.
+    from app.screen_capture_integration import install as install_screen_capture
+    install_screen_capture()
+
     from app.ui import main_ui
     from PySide6 import QtWidgets
 
