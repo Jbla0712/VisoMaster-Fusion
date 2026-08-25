@@ -8,6 +8,16 @@ IF EXIST ".venv" (
     call conda activate visomaster
 )
 
+REM Screen Capture uses DXGI Desktop Duplication through dxcam.
+python -c "import dxcam" >nul 2>&1
+IF %ERRORLEVEL% NEQ 0 (
+    echo Installing optional DXGI screen-capture dependency: dxcam...
+    python -m pip install dxcam
+    IF %ERRORLEVEL% NEQ 0 (
+        echo [WARN] Could not install dxcam automatically. Screen Capture will be unavailable.
+    )
+)
+
 REM Run main.py
 echo Running VisoMaster...
 python main.py
