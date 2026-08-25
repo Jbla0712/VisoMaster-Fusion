@@ -282,7 +282,6 @@ def _install_target_media_source() -> None:
                 except Exception:
                     pass
 
-            # Reuse VisoMaster's existing live-source/webcam pipeline.
             vp._screen_capture_source = source
             vp.media_capture = source
             vp.media_rotation = 0
@@ -329,7 +328,7 @@ def _install_target_media_source() -> None:
 
     def load_target_webcams(main_window, *args, **kwargs):
         original_load_target_webcams(main_window, *args, **kwargs)
-        if not IS_WINDOWS or not main_window.targetVideosFilterWebcamsCheckBox.isChecked():
+        if not IS_WINDOWS:
             return
 
         existing = main_window.target_videos.get("screen-capture")
