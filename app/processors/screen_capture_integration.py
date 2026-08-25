@@ -38,7 +38,7 @@ class ScreenCaptureSource:
     def __init__(self, monitor_index=0, fps=30.0):
         monitors=enumerate_monitors()
         if not monitors: raise RuntimeError("No Windows display monitor was detected.")
-        self.monitors=monitors; self.monitor_index=max(0,min(int(monitor_index),len(monitors)-1)); self.fps=max(1.0,min(float(fps),120.0)); self.monitor=monitors[self.monitor_index]; self._opened=True; self._next_capture_time=0.0
+        self.monitors=monitors; self.monitor_index=max(0,min(int(monitor_index),len(monitors)-1)); self.fps=max(1.0,min(float(fps),120.0)); self.monitor=monitors[self.monitor_index]; self._opened=True; self._next_capture_time=0.0; self._logged_first_frame=False
     @property
     def width(self): return self.monitor.width
     @property
@@ -50,7 +50,10 @@ class ScreenCaptureSource:
         self._next_capture_time=time.perf_counter()+delay
         try:
             image=ImageGrab.grab(bbox=(self.monitor.left,self.monitor.top,self.monitor.right,self.monitor.bottom),all_screens=True)
-            rgb=np.asarray(image.convert("RGB"),dtype=np.uint8); return True,np.ascontiguousarray(rgb[:,:,::-1])
+            rgb=np.asarray(image.convert("RGB"),dtype=np.uint8); frame=np.ascontiguousarray(rgb[:,:,::-1])
+            if not self._logged_first_frame:
+                print(f"[INFO] Screen Capture first frame acquired: {frame.shape[1]}x{frame.shape[0]}"); self._logged_first_frame=True
+            return True,frame
         except Exception as exc:
             print(f"[ERROR] Screen capture failed: {exc}"); return False,None
     def isOpened(self): return self._opened
@@ -72,19 +75,32 @@ def _thumbnail():
     if not ok:return None
     h,w=frame.shape[:2]; return QtGui.QImage(frame.data,w,h,int(frame.strides[0]),QtGui.QImage.Format.Format_BGR888).copy()
 
+def _keep_screen_source(mw):
+    vp=getattr(mw,"video_processor",None); source=getattr(vp,"_screen_capture_source",None) if vp else None
+    if source is not None and source.isOpened() and getattr(vp,"_screen_capture_active",False) and vp.media_capture is not source:
+        old=vp.media_capture
+        if old is not None and old is not source:
+            try: old.release()
+            except Exception: pass
+        vp.media_capture=source
+
 def _load_screen(self):
     mw=self.main_window; vp=mw.video_processor
     try:
-        vp.stop_processing(); source=ScreenCaptureSource(getattr(mw,"_screen_capture_monitor",0),getattr(mw,"_screen_capture_fps",30))
-        ok,frame=source.read()
+        vp.stop_processing()
+        source=ScreenCaptureSource(getattr(mw,"_screen_capture_monitor",0),getattr(mw,"_screen_capture_fps",30)); ok,frame=source.read()
         if not ok: source.release(); raise RuntimeError("Unable to capture monitor")
-        if vp.media_capture:
+        if vp.media_capture and vp.media_capture is not getattr(vp,"_screen_capture_source",None):
             try: vp.media_capture.release()
             except Exception: pass
-        vp._screen_capture_source=source; vp.media_capture=source; vp.media_rotation=0; vp.media_path="screen://monitor"; vp.file_type="webcam"; vp.fps=source.fps; vp.max_frame_number=999999999; vp.current_frame_number=0; vp.next_frame_to_display=0; vp.current_frame=frame
+        vp._screen_capture_source=source; vp._screen_capture_active=True; vp.media_capture=source
+        vp.media_rotation=0; vp.media_path="screen://monitor"; vp.file_type="webcam"; vp.fps=source.fps; vp.max_frame_number=999999999; vp.current_frame_number=0; vp.next_frame_to_display=0; vp.current_frame=frame
         from app.ui.widgets.actions import common_actions,graphics_view_actions
         mw.scene.clear(); pixmap=common_actions.get_pixmap_from_frame(mw,frame); graphics_view_actions.update_graphics_view(mw,pixmap,0,reset_fit=True); self.reset_related_widgets_and_values(); mw.videoSeekSlider.setMaximum(999999999); mw.videoSeekSlider.setValue(0); mw.selected_video_button=self; mw.loading_new_media=True; common_actions.refresh_frame(mw,synchronous=True)
-        print("[INFO] Screen Capture selected.")
+        if not hasattr(mw,"_screen_capture_keepalive_timer"):
+            timer=QtCore.QTimer(mw); timer.setInterval(10); timer.timeout.connect(lambda: _keep_screen_source(mw)); mw._screen_capture_keepalive_timer=timer
+        mw._screen_capture_keepalive_timer.start()
+        print("[INFO] Screen Capture selected; live source locked to screen capture.")
     except Exception as exc: print(f"[ERROR] Could not initialize screen capture: {exc}")
 
 def add_screen_capture_card(mw):
@@ -98,21 +114,16 @@ def add_screen_capture_card(mw):
     if button is not None:
         button.file_type="screen"
         if button.list_item is not None: button.list_item.setFileType("video")
-    mw._screen_capture_card_added=True
-    print("[INFO] Screen Capture source added to Target Media.")
+    mw._screen_capture_card_added=True; print("[INFO] Screen Capture source added to Target Media.")
 
 def open_screen_capture_window(mw):
     monitors=enumerate_monitors()
-    if not monitors:
-        QtWidgets.QMessageBox.warning(mw,"Screen Capture","Aucun écran Windows détecté."); return
-    dialog=QtWidgets.QDialog(mw); dialog.setWindowTitle("Screen Capture"); dialog.setMinimumWidth(420)
-    layout=QtWidgets.QFormLayout(dialog); monitor=QtWidgets.QComboBox(dialog); fps=QtWidgets.QSpinBox(dialog); fps.setRange(5,120); fps.setValue(30)
+    if not monitors: QtWidgets.QMessageBox.warning(mw,"Screen Capture","Aucun écran Windows détecté."); return
+    dialog=QtWidgets.QDialog(mw); dialog.setWindowTitle("Screen Capture"); dialog.setMinimumWidth(420); layout=QtWidgets.QFormLayout(dialog); monitor=QtWidgets.QComboBox(dialog); fps=QtWidgets.QSpinBox(dialog); fps.setRange(5,120); fps.setValue(30)
     for m in monitors: monitor.addItem(m.label,m.index)
-    layout.addRow("Écran :",monitor); layout.addRow("FPS :",fps)
-    buttons=QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel|QtWidgets.QDialogButtonBox.StandardButton.Ok,parent=dialog); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addRow(buttons)
+    layout.addRow("Écran :",monitor); layout.addRow("FPS :",fps); buttons=QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel|QtWidgets.QDialogButtonBox.StandardButton.Ok,parent=dialog); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addRow(buttons)
     if dialog.exec()!=QtWidgets.QDialog.DialogCode.Accepted:return
-    mw._screen_capture_monitor=int(monitor.currentData()); mw._screen_capture_fps=float(fps.value()); add_screen_capture_card(mw)
-    button=mw.target_videos.get("screen-capture")
+    mw._screen_capture_monitor=int(monitor.currentData()); mw._screen_capture_fps=float(fps.value()); add_screen_capture_card(mw); button=mw.target_videos.get("screen-capture")
     if button is not None: button.click()
 
 def _install_target_hook():
@@ -129,25 +140,21 @@ def _install_window_hook():
     original=MainWindow.__init__
     if getattr(original,"_screen_capture_original",False):return
     def init(self,*args,**kwargs):
-        original(self,*args,**kwargs)
-        button=QtWidgets.QPushButton("Screen Capture",self.dockWidgetContents)
-        button.setToolTip("Capture a Windows monitor as the live source")
-        button.clicked.connect(lambda: open_screen_capture_window(self))
-        self.horizontalLayout_7.insertWidget(1,button)
-        QtCore.QTimer.singleShot(0,lambda: add_screen_capture_card(self))
-        print("[INFO] Screen Capture button added to Target Media dock.")
+        original(self,*args,**kwargs); button=QtWidgets.QPushButton("Screen Capture",self.dockWidgetContents); button.setToolTip("Capture a Windows monitor as the live source"); button.clicked.connect(lambda: open_screen_capture_window(self)); self.horizontalLayout_7.insertWidget(1,button); QtCore.QTimer.singleShot(0,lambda: add_screen_capture_card(self)); print("[INFO] Screen Capture button added to Target Media dock.")
     init._screen_capture_original=True; MainWindow.__init__=init
 
 def _install_processor_hook():
     from app.processors.video_processor import VideoProcessor
     original=VideoProcessor.stop_processing
-    if getattr(original,"_screen_capture_original",False):return
+    if getattr(original,"_screen_capture_original",False): return
     def stop(self,*args,**kwargs):
-        result=original(self,*args,**kwargs); source=getattr(self,"_screen_capture_source",None)
-        if source is not None and not source.isOpened():
-            try:
-                source=ScreenCaptureSource(getattr(self.main_window,"_screen_capture_monitor",0),getattr(self.main_window,"_screen_capture_fps",30)); self._screen_capture_source=source; self.media_capture=source
-            except Exception as exc: print(f"[WARN] Could not reopen screen capture: {exc}")
+        result=original(self,*args,**kwargs)
+        if getattr(self,"_screen_capture_active",False):
+            source=getattr(self,"_screen_capture_source",None)
+            if source is not None and not source.isOpened():
+                try: source=ScreenCaptureSource(getattr(self.main_window,"_screen_capture_monitor",0),getattr(self.main_window,"_screen_capture_fps",30)); self._screen_capture_source=source
+                except Exception as exc: print(f"[WARN] Could not reopen screen capture: {exc}")
+            if source is not None: self.media_capture=source
         return result
     stop._screen_capture_original=True; VideoProcessor.stop_processing=stop
 
