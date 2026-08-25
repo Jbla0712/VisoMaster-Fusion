@@ -6,7 +6,6 @@ from pathlib import Path
 
 
 def _write_crash_log(exc: BaseException) -> Path:
-    """Persist a full traceback so startup failures remain diagnosable."""
     log_dir = Path(__file__).resolve().parent / "crash_logs"
     log_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -26,12 +25,11 @@ def _write_crash_log(exc: BaseException) -> Path:
 
 
 def _run_app() -> None:
-    # main_ui must finish importing before the screen-capture integration is
-    # installed. The integration imports settings_layout_data, whose module
-    # initialization otherwise creates a circular import.
+    # Let all normal UI modules finish importing first. Screen capture patches
+    # are installed only after main_ui is fully initialized, avoiding the
+    # settings_layout_data circular import.
     from app.ui import main_ui
     from PySide6 import QtWidgets, QtCore
-
     import qdarktheme
     from app.ui.core.proxy_style import ProxyStyle
 
@@ -46,9 +44,6 @@ def _run_app() -> None:
         _style = qdarktheme.load_stylesheet(theme="dark", custom_colors={"primary": "#4090a3"}) + "\n" + _style
         app.setStyleSheet(_style)
 
-    # All UI modules are now initialized, so it is safe to install the source
-    # hooks. Do this before MainWindow construction so its target-media hook is
-    # available when the window builds its lists.
     if sys.platform == "win32":
         try:
             from app.processors.screen_capture_integration import install as install_screen_capture
@@ -59,8 +54,6 @@ def _run_app() -> None:
     window = main_ui.MainWindow(gpu_id=args.gpu_id)
     window.show()
 
-    # Also schedule an explicit post-construction insertion. This is independent
-    # of MainWindow.__init__ monkey-patching and is the final UI safety net.
     if sys.platform == "win32":
         try:
             from app.processors.screen_capture_integration import add_screen_capture_card
