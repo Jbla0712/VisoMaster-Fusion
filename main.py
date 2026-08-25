@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _write_crash_log(exc: BaseException) -> Path:
-    """Persist a full traceback to disk so the diagnostic survives even if the console window closes before the user can copy it."""
+    """Persist a full traceback so startup failures remain diagnosable."""
     log_dir = Path(__file__).resolve().parent / "crash_logs"
     log_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -26,13 +26,9 @@ def _write_crash_log(exc: BaseException) -> Path:
 
 
 def _run_app() -> None:
-    if sys.platform == "win32":
-        try:
-            from app.processors.screen_capture_integration import install as install_screen_capture
-            install_screen_capture()
-        except Exception as exc:
-            print(f"[WARN] Screen capture integration could not be initialized: {exc}")
-
+    # main_ui must finish importing before the screen-capture integration is
+    # installed. The integration imports settings_layout_data, whose module
+    # initialization otherwise creates a circular import.
     from app.ui import main_ui
     from PySide6 import QtWidgets, QtCore
 
@@ -50,12 +46,21 @@ def _run_app() -> None:
         _style = qdarktheme.load_stylesheet(theme="dark", custom_colors={"primary": "#4090a3"}) + "\n" + _style
         app.setStyleSheet(_style)
 
+    # All UI modules are now initialized, so it is safe to install the source
+    # hooks. Do this before MainWindow construction so its target-media hook is
+    # available when the window builds its lists.
+    if sys.platform == "win32":
+        try:
+            from app.processors.screen_capture_integration import install as install_screen_capture
+            install_screen_capture()
+        except Exception as exc:
+            print(f"[WARN] Screen capture integration could not be initialized: {exc}")
+
     window = main_ui.MainWindow(gpu_id=args.gpu_id)
     window.show()
 
-    # Explicit post-construction hook. This is intentionally independent of
-    # MainWindow.__init__ monkey-patching: it runs after every widget/list has
-    # actually been created and therefore guarantees the card can be inserted.
+    # Also schedule an explicit post-construction insertion. This is independent
+    # of MainWindow.__init__ monkey-patching and is the final UI safety net.
     if sys.platform == "win32":
         try:
             from app.processors.screen_capture_integration import add_screen_capture_card
