@@ -22,16 +22,11 @@ class MonitorInfo:
     bottom: int
 
     @property
-    def width(self):
-        return max(1, self.right - self.left)
-
+    def width(self): return max(1, self.right - self.left)
     @property
-    def height(self):
-        return max(1, self.bottom - self.top)
-
+    def height(self): return max(1, self.bottom - self.top)
     @property
-    def label(self):
-        return f"Monitor {self.index + 1} ({self.width}x{self.height})"
+    def label(self): return f"Monitor {self.index + 1} ({self.width}x{self.height})"
 
 
 def enumerate_monitors():
@@ -107,7 +102,11 @@ class ScreenCaptureSource:
             pass
         return 0.0
 
-    def set(self, *_args): return False
+    def set(self, *_args):
+        # VideoProcessor's live-source path performs a harmless frame seek on startup.
+        # Desktop capture is continuous, so treat it as a successful no-op.
+        return True
+
     def open(self, *_args): self._opened = True; return True
 
 
@@ -122,7 +121,12 @@ def _thumbnail():
 
 
 def _load_screen(self):
-    """Load desktop capture without entering VideoProcessor's webcam path."""
+    """Load desktop capture as a webcam-compatible live source.
+
+    The VideoProcessor webcam pipeline is used only as a generic live-source
+    feeder. No cv2.VideoCapture is created and the physical webcam is never
+    opened; media_capture remains our ScreenCaptureSource instance.
+    """
     mw = self.main_window
     vp = mw.video_processor
     try:
@@ -143,8 +147,9 @@ def _load_screen(self):
         vp.media_capture = source
         vp.media_rotation = 0
         vp.media_path = "screen://monitor"
-        # Do not use "webcam": that path opens cv2.VideoCapture and replaces our source.
-        vp.file_type = "screen"
+        # IMPORTANT: use the existing live/webcam processing path without using
+        # TargetMedia's webcam loader. That loader is what opens cv2.VideoCapture.
+        vp.file_type = "webcam"
         vp.fps = source.fps
         vp.max_frame_number = 999999999
         vp.current_frame_number = 0
@@ -161,7 +166,7 @@ def _load_screen(self):
         mw.selected_video_button = self
         mw.loading_new_media = True
         common_actions.refresh_frame(mw, synchronous=True)
-        print(f"[INFO] Screen Capture active: monitor={source.monitor_index + 1}, {source.width}x{source.height}, {source.fps:g} FPS")
+        print(f"[INFO] Screen Capture active: monitor={source.monitor_index + 1}, {source.width}x{source.height}, {source.fps:g} FPS (live-source pipeline)")
     except Exception as exc:
         print(f"[ERROR] Could not initialize screen capture: {exc}")
 
