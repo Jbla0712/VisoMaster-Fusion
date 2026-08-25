@@ -20,7 +20,6 @@ def _write_crash_log(exc: BaseException) -> Path:
         f.write("=" * 70 + "\n")
         try:
             import platform
-
             f.write(f"Python:   {sys.version}\n")
             f.write(f"Platform: {platform.platform()}\n")
         except Exception:
@@ -31,38 +30,45 @@ def _write_crash_log(exc: BaseException) -> Path:
 
 
 def _run_app() -> None:
-    """Boot the Qt app. Imports are inside the function so any startup error is
-    captured by the outer try/except (otherwise a top-level import error would
-    bypass the crash-log writer)."""
+    """Boot the Qt app and install optional Windows live-capture sources."""
     from app.ui import main_ui
-    from PySide6 import QtWidgets
+    from PySide6 import QtWidgets, QtCore
 
     import qdarktheme
     from app.ui.core.proxy_style import ProxyStyle
 
     parser = argparse.ArgumentParser(description="VisoMaster")
-    parser.add_argument(
-        "--gpu-id",
-        type=int,
-        default=0,
-        help="CUDA GPU device ID to use (default: 0)",
-    )
+    parser.add_argument("--gpu-id", type=int, default=0, help="CUDA GPU device ID to use (default: 0)")
     args, remaining = parser.parse_known_args()
 
     app = QtWidgets.QApplication(remaining)
     app.setStyle(ProxyStyle())
     with open("app/ui/styles/true_dark_styles.qss", "r") as f:
-        _style = f.read()
-        _style = (
-            qdarktheme.load_stylesheet(
-                theme="dark", custom_colors={"primary": "#4090a3"}
-            )
-            + "\n"
-            + _style
-        )
+        _style = qdarktheme.load_stylesheet(theme="dark", custom_colors={"primary": "#4090a3"}) + "\n" + f.read()
         app.setStyleSheet(_style)
+
+    if sys.platform == "win32":
+        try:
+            from app.processors.camera_capture_optimization import install as install_camera_capture
+            install_camera_capture()
+        except Exception as exc:
+            print(f"[WARN] Low-latency camera capture unavailable: {exc}")
+        try:
+            from app.processors.screen_capture_integration import install as install_screen_capture
+            install_screen_capture()
+        except Exception as exc:
+            print(f"[WARN] Screen Capture integration unavailable: {exc}")
+
     window = main_ui.MainWindow(gpu_id=args.gpu_id)
     window.show()
+
+    if sys.platform == "win32":
+        try:
+            from app.processors.screen_capture_integration import add_screen_capture_card
+            QtCore.QTimer.singleShot(0, lambda: add_screen_capture_card(window))
+        except Exception as exc:
+            print(f"[WARN] Screen Capture UI unavailable: {exc}")
+
     app.exec()
 
 
